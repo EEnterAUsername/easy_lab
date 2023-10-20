@@ -7,6 +7,50 @@
 static struct uthread *current_thread = NULL;
 static struct uthread *main_thread = NULL;
 
+#define MAX_LEN_Q 114
+
+struct uthread_queue {
+    struct uthread *queue[MAX_LEN_Q];
+    int front, rear;
+};
+
+static struct uthread_queue Q_init;
+
+void init_(struct uthread_queue *q_) {
+    q_->front = -1;
+    q_->rear = -1;
+}
+
+void insert_(struct uthread_queue *q_, struct uthread *thread) {
+    if (q_->rear == MAX_LEN_Q - 1) {
+        printf("@@@ full !!!!\n");
+        exit(-1);
+    }
+    q_->rear++;
+    q_->queue[q_->rear] = thread;
+    if (q_->front == -1) {
+        q_->front = 0;
+    }
+}
+
+struct uthread *pop_(struct uthread_queue *q_) {
+    if (q_->front == -1) {
+        printf("@@@ empty !!!!\n");
+        exit(-1);
+    }
+    struct uthread *thread = q_->queue[q_->front];
+    for (int i = q_->front; i < q_->rear; i++) {
+        q_->queue[i] = q_->queue[i + 1];
+    }
+    if (q_->front == q_->rear) {
+        q_->front = q_->rear = -1;
+    } else {
+        q_->rear--;
+    }
+    return thread;
+}
+
+
 /// @brief 切换上下文
 /// @param from 当前上下文
 /// @param to 要切换到的上下文
@@ -48,35 +92,67 @@ struct uthread *uthread_create(void (*func)(void *), void *arg,const char* threa
   //  high   |    fake return addr    |
   //         +------------------------+
 
-  /*
-  TODO: 在这里初始化uthread结构体。可能包括设置rip,rsp等寄存器。入口地址需要是函数_uthread_entry.
-        除此以外，还需要设置uthread上的一些状态，保存参数等等。
-        
-        你需要注意rsp寄存器在这里要8字节对齐，否则后面从context switch进入其他函数的时候会有rsp寄存器
-        不对齐的情况（表现为在printf里面Segment Fault）
-  */
+  // 初始化uthread结构体，包括设置rip, rsp等寄存器，入口地址为函数_uthread_entry
+  long long sp = ((long long)&uthread->stack + STACK_SIZE) & (~(long long)15);
+  sp -= 8; // 对齐
+  uthread->context.rsp = sp;
+  uthread->context.rip = (long long)_uthread_entry;
+  uthread->context.rdi = (long long)uthread;
+  uthread->context.rsi = (long long)func;
+  uthread->context.rdx = (long long)arg;
+  uthread->name = thread_name;
+  uthread->state = THREAD_INIT;
+  // 插入新创建的线程到队列
+  insert_(&Q_init, uthread);
+  // 在队列中插入新创建的线程
+  // 插入到队列中，可能是Q_init或其他队列
+  // insert_(&Q_init, uthread);
+
   return uthread;
 }
 
-
 void schedule() {
-  /*
-  TODO: 在这里写调度子线程的机制。这里需要实现一个FIFO队列。这意味着你需要一个额外的队列来保存目前活跃
-        的线程。一个基本的思路是，从队列中取出线程，然后使用resume恢复函数上下文。重复这一过程。
-  */
+
+  // 实现一个FIFO队列
+  if (Q_init.front == -1) { // 如果队列为空，说明没有待调度的线程
+    struct uthread *pre_thread = current_thread;
+    current_thread = main_thread;
+    thread_switch(&pre_thread->context, &current_thread->context); // 切换到主线程
+    current_thread->state = THREAD_STOP; // 设置主线程为停止态
+    thread_destory(current_thread); // 销毁主线程
+  }
+  // 取出下个线程
+  struct uthread *next_thread = pop_(&Q_init);
+  if (next_thread->state == THREAD_INIT) { // 若是初始态
+    struct uthread *previous_thread = current_thread;
+    current_thread = next_thread;
+    thread_switch(&previous_thread->context, &current_thread->context);
+  } 
+  else if (next_thread->state == THREAD_SUSPENDED) {// 若是挂起态
+    uthread_resume(next_thread);// 恢复
+  } 
+  else if (next_thread->state == THREAD_STOP) {// 若是停止态
+    printf("!!! stop !!!\n");
+  }
 }
 
 long long uthread_yield() {
-  /*
-  TODO: 用户态线程让出控制权到调度器。由正在执行的用户态函数来调用。记得调整tcb状态。
-  */
-  return 0;
+    current_thread->state = THREAD_SUSPENDED;
+    insert_(&Q_init, current_thread); // 插入当前线程到队列
+    schedule(); // 调度下一个线程执行
+    return 0;
 }
+
 
 void uthread_resume(struct uthread *tcb) {
   /*
   TODO：调度器恢复到一个函数的上下文。
   */
+  struct uthread *pre_thread = current_thread;
+  current_thread = tcb;
+  // 恢复线程的执行，将其状态设置为运行
+  tcb->state = THREAD_RUNNING;
+  thread_switch(&pre_thread->context, &tcb->context);
 }
 
 void thread_destory(struct uthread *tcb) {
@@ -86,11 +162,32 @@ void thread_destory(struct uthread *tcb) {
 void _uthread_entry(struct uthread *tcb, void (*thread_func)(void *),
                     void *arg) {
   /*
-  TODO: 这是所有用户态线程函数开始执行的入口。在这个函数中，你需要传参数给真正调用的函数，然后设置tcb的状态。
+  这是所有用户态线程函数开始执行的入口。在这个函数中，你需要传参数给真正调用的函数，然后设置tcb的状态。
   */
+  tcb->state = THREAD_RUNNING; // 设置线程状态为运行
+  // 调用线程函数，传递参数
+  thread_func(arg);
+  tcb->state = THREAD_STOP; // 设置线程状态为停止
+  free(tcb); // 释放线程控制块内存
+  schedule(); // 调度下一个线程执行
 }
 
 void init_uthreads() {
-  main_thread = malloc(sizeof(struct uthread));
-  make_dummpy_context(&main_thread->context);
+    main_thread = malloc(sizeof(struct uthread));
+    make_dummpy_context(&main_thread->context);
+ 
+    // 初始化其他数据结构和变量
+    init_(&Q_init);
+
+    long long sp = ((long long)&main_thread->stack + STACK_SIZE) & (~(long long)15);
+    sp -= 8; // 对齐
+    main_thread->context.rsp = sp;
+    main_thread->context.rip = (long long)_uthread_entry;
+    main_thread->context.rdi = (long long)main_thread;
+    main_thread->context.rsi = (long long)NULL;
+    main_thread->context.rdx = (long long)NULL;
+    main_thread->state = THREAD_RUNNING;
+    main_thread->name = "main_thread";
+
+    current_thread = main_thread;
 }
